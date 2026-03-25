@@ -18,6 +18,13 @@ pub fn run() {
             commands::get_stored_auth,
             commands::verify_token,
             commands::logout,
+            commands::fetch_launcher_config,
+            commands::save_launcher_config,
+            commands::fetch_slides,
+            commands::get_cached_slides,
+            commands::upload_slide,
+            commands::delete_slide,
+            commands::save_slide_order,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

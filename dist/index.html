@@ -19,7 +19,6 @@
 
   <!-- Main Content -->
   <div id="app">
-    <!-- Header: User info / Sign In -->
     <div id="header">
       <div id="user-area">
         <div id="signed-out">
@@ -30,23 +29,19 @@
           <span id="user-name"></span>
           <button id="btn-signout" class="btn btn-small">Sign Out</button>
         </div>
+        <button id="btn-settings" class="btn btn-icon" title="Settings" style="display:none">&#9881;</button>
       </div>
-      <button id="btn-settings" class="btn btn-icon" title="Settings">&#9881;</button>
     </div>
 
-    <!-- Center spacer -->
     <div id="center"></div>
 
-    <!-- Bottom Controls -->
     <div id="controls">
-      <!-- Install Path -->
       <div id="path-row">
         <label>Install Path:</label>
         <input type="text" id="install-path" readonly />
         <button id="btn-browse" class="btn btn-secondary">Browse</button>
       </div>
 
-      <!-- Progress Bar -->
       <div id="progress-container" style="display:none">
         <div id="progress-bar">
           <div id="progress-fill"></div>
@@ -54,47 +49,87 @@
         <span id="progress-text">0%</span>
       </div>
 
-      <!-- Action Buttons -->
       <div id="action-row">
         <button id="btn-check" class="btn btn-secondary">Check Updates</button>
         <button id="btn-play" class="btn btn-primary">PLAY</button>
       </div>
 
-      <!-- Console Log -->
       <div id="console">
         <div id="console-log"></div>
       </div>
     </div>
   </div>
 
-  <!-- Settings Panel (hidden by default) -->
+  <!-- Admin / Settings Panel (full overlay) -->
   <div id="settings-panel" style="display:none">
-    <div id="settings-content">
-      <h2>Settings</h2>
-      <div class="setting-group">
-        <label>Build Server URL</label>
-        <input type="text" id="set-build-url" />
+    <!-- Tabs at top -->
+    <div id="panel-tabs">
+      <button class="panel-tab active" data-tab="tab-settings">Settings</button>
+      <button class="panel-tab" data-tab="tab-slides" id="tab-slides-btn" style="display:none">Slideshow</button>
+      <div id="panel-close-area"><button id="btn-panel-close" class="btn btn-icon" title="Close">&#10005;</button></div>
+    </div>
+
+    <!-- Tab 1: Settings -->
+    <div id="tab-settings" class="tab-content active">
+      <div class="setting-group" style="margin-bottom:20px;">
+        <label>Launcher Greeting</label>
+        <input type="text" id="set-greeting" placeholder="Launcher ready." />
       </div>
-      <div class="setting-group">
-        <label>SSO URL</label>
-        <input type="text" id="set-sso-url" />
-      </div>
-      <div class="setting-group">
-        <label>Code Signing Identity (macOS)</label>
-        <input type="text" id="set-signing-identity" placeholder="Developer ID Application: ..." />
-      </div>
-      <div class="setting-group">
-        <label>Apple Team ID</label>
-        <input type="text" id="set-apple-team" placeholder="XXXXXXXXXX" />
-      </div>
-      <div class="setting-group">
-        <label>Windows Certificate Path</label>
-        <input type="text" id="set-win-cert" placeholder="C:\certs\certificate.pfx" />
+      <div class="settings-grid">
+        <div class="setting-group">
+          <label>Build Server URL</label>
+          <input type="text" id="set-build-url" />
+        </div>
+        <div class="setting-group">
+          <label>SSO URL</label>
+          <input type="text" id="set-sso-url" />
+        </div>
+        <div class="setting-group">
+          <label>Code Signing Identity (macOS)</label>
+          <input type="text" id="set-signing-identity" placeholder="Developer ID Application: ..." />
+        </div>
+        <div class="setting-group">
+          <label>Apple Team ID</label>
+          <input type="text" id="set-apple-team" placeholder="XXXXXXXXXX" />
+        </div>
+        <div class="setting-group">
+          <label>Windows Certificate Path</label>
+          <input type="text" id="set-win-cert" placeholder="C:\certs\certificate.pfx" />
+        </div>
       </div>
       <div id="settings-buttons">
         <button id="btn-settings-save" class="btn btn-primary">Save</button>
         <button id="btn-settings-cancel" class="btn btn-secondary">Cancel</button>
       </div>
+    </div>
+
+    <!-- Tab 2: Slideshow Manager (admin only) -->
+    <div id="tab-slides" class="tab-content">
+      <p class="slides-desc">Drag to reorder. Up to 6 slides. Changes go live immediately.</p>
+      <div id="slides-grid"></div>
+      <div id="slides-actions">
+        <span id="slides-status"></span>
+        <label id="btn-upload-slide" class="btn btn-primary">
+          Upload Image
+          <input type="file" id="slide-file-input" accept="image/jpeg,image/png,image/webp" style="display:none" />
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Replace Slide Modal -->
+  <div id="replace-modal" style="display:none">
+    <div id="replace-modal-content">
+      <h3>Replace Slide</h3>
+      <div id="replace-preview"></div>
+      <div id="replace-actions">
+        <label id="btn-replace-file" class="btn btn-primary">
+          Choose New Image
+          <input type="file" id="replace-file-input" accept="image/jpeg,image/png,image/webp" style="display:none" />
+        </label>
+        <button id="btn-replace-cancel" class="btn btn-secondary">Cancel</button>
+      </div>
+      <div id="replace-status"></div>
     </div>
   </div>
 

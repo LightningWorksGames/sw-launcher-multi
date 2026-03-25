@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -26,9 +27,9 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             install_path: default_install_path(),
-            build_server_url: "http://147.93.30.25:8888/rizzeadmin/SWBuild/raw/branch/main"
+            build_server_url: "https://raw.githubusercontent.com/LightningWorksGames/SiegeWorldsBuild/main"
                 .to_string(),
-            sso_url: "https://sso.lightningworks.io".to_string(),
+            sso_url: "http://localhost:3000".to_string(),
             signing_identity: String::new(),
             apple_team_id: String::new(),
             windows_cert_path: String::new(),
@@ -39,15 +40,38 @@ impl Default for AppSettings {
 fn default_install_path() -> String {
     if cfg!(target_os = "macos") {
         dirs::home_dir()
-            .map(|h| h.join("Games").join("Siege Worlds").to_string_lossy().to_string())
+            .map(|h| {
+                h.join("Games")
+                    .join("Siege Worlds")
+                    .to_string_lossy()
+                    .to_string()
+            })
             .unwrap_or_else(|| "/Applications/Siege Worlds".to_string())
+    } else if cfg!(target_os = "linux") {
+        dirs::home_dir()
+            .map(|h| {
+                h.join("Games")
+                    .join("Siege Worlds")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "/opt/siege-worlds".to_string())
     } else {
         "C:\\Games\\Siege Worlds".to_string()
     }
 }
 
+// ─── Store Helpers ──────────────────────────────────────────────────────────
+
 fn get_store(app: &AppHandle) -> Arc<Store<tauri::Wry>> {
     app.store("settings.json").expect("failed to access store")
+}
+
+fn store_get_string(store: &Store<tauri::Wry>, key: &str, default: String) -> String {
+    store
+        .get(key)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or(default)
 }
 
 #[tauri::command]
@@ -55,30 +79,12 @@ pub fn get_settings(app: AppHandle) -> AppSettings {
     let store = get_store(&app);
     let defaults = AppSettings::default();
     AppSettings {
-        install_path: store
-            .get("install_path")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or(defaults.install_path),
-        build_server_url: store
-            .get("build_server_url")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or(defaults.build_server_url),
-        sso_url: store
-            .get("sso_url")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or(defaults.sso_url),
-        signing_identity: store
-            .get("signing_identity")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or(defaults.signing_identity),
-        apple_team_id: store
-            .get("apple_team_id")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or(defaults.apple_team_id),
-        windows_cert_path: store
-            .get("windows_cert_path")
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or(defaults.windows_cert_path),
+        install_path: store_get_string(&store, "install_path", defaults.install_path),
+        build_server_url: store_get_string(&store, "build_server_url", defaults.build_server_url),
+        sso_url: store_get_string(&store, "sso_url", defaults.sso_url),
+        signing_identity: store_get_string(&store, "signing_identity", defaults.signing_identity),
+        apple_team_id: store_get_string(&store, "apple_team_id", defaults.apple_team_id),
+        windows_cert_path: store_get_string(&store, "windows_cert_path", defaults.windows_cert_path),
     }
 }
 
@@ -86,20 +92,11 @@ pub fn get_settings(app: AppHandle) -> AppSettings {
 pub fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
     let store = get_store(&app);
     store.set("install_path", serde_json::json!(settings.install_path));
-    store.set(
-        "build_server_url",
-        serde_json::json!(settings.build_server_url),
-    );
+    store.set("build_server_url", serde_json::json!(settings.build_server_url));
     store.set("sso_url", serde_json::json!(settings.sso_url));
-    store.set(
-        "signing_identity",
-        serde_json::json!(settings.signing_identity),
-    );
+    store.set("signing_identity", serde_json::json!(settings.signing_identity));
     store.set("apple_team_id", serde_json::json!(settings.apple_team_id));
-    store.set(
-        "windows_cert_path",
-        serde_json::json!(settings.windows_cert_path),
-    );
+    store.set("windows_cert_path", serde_json::json!(settings.windows_cert_path));
     store.save().map_err(|e| format!("Failed to save: {}", e))
 }
 
@@ -120,17 +117,13 @@ pub async fn select_install_path(app: AppHandle) -> Result<String, String> {
 
 // ─── Path Safety ────────────────────────────────────────────────────────────
 
-/// Validate that a manifest file path is safe (no path traversal attacks).
 fn validate_manifest_path(path: &str) -> Result<(), String> {
-    // Reject absolute paths
     if path.starts_with('/') || path.starts_with('\\') {
         return Err(format!("Rejected absolute path in manifest: {}", path));
     }
-    // Reject Windows drive letters (e.g. C:\)
     if path.len() >= 2 && path.as_bytes()[1] == b':' {
         return Err(format!("Rejected absolute path in manifest: {}", path));
     }
-    // Reject path traversal components
     for component in path.split(['/', '\\']) {
         if component == ".." {
             return Err(format!(
@@ -144,7 +137,6 @@ fn validate_manifest_path(path: &str) -> Result<(), String> {
 
 // ─── File Hashing ───────────────────────────────────────────────────────────
 
-/// Compute SHA-256 hash of a file, returned as lowercase hex string.
 fn hash_file(path: &PathBuf) -> Result<String, String> {
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("Failed to open for hashing: {}", e))?;
@@ -162,11 +154,15 @@ fn hash_file(path: &PathBuf) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Compute SHA-256 hash of a byte slice, returned as lowercase hex string.
 fn hash_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+/// Case-insensitive hash comparison (handles uppercase/lowercase hex from different tools).
+fn hashes_match(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 // ─── Game Download & Launch ─────────────────────────────────────────────────
@@ -184,12 +180,20 @@ struct DownloadProgress {
     file: String,
 }
 
-/// Shared logic to fetch and parse the manifest, with an HTTPS warning.
+/// Shared HTTP client — created once, reused for all requests.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 async fn fetch_manifest(
     app: &AppHandle,
+    client: &reqwest::Client,
     base_url: &str,
 ) -> Result<Vec<ManifestEntry>, String> {
-    // Warn if build server is not using HTTPS
     if base_url.starts_with("http://") {
         app.emit(
             "log",
@@ -200,12 +204,18 @@ async fn fetch_manifest(
     }
 
     let manifest_url = format!("{}/file_manifest.json", base_url);
-    let client = reqwest::Client::new();
     let res = client
         .get(&manifest_url)
         .send()
         .await
         .map_err(|e| format!("Failed to fetch manifest: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!(
+            "Manifest server returned {}",
+            res.status()
+        ));
+    }
 
     let text = res
         .text()
@@ -215,7 +225,6 @@ async fn fetch_manifest(
     let entries: Vec<ManifestEntry> =
         serde_json::from_str(&text).map_err(|e| format!("Failed to parse manifest: {}", e))?;
 
-    // Validate all paths before returning
     for entry in &entries {
         validate_manifest_path(&entry.path)?;
     }
@@ -223,23 +232,45 @@ async fn fetch_manifest(
     Ok(entries)
 }
 
+/// Collect all files under a directory recursively, returning paths relative to the base.
+fn collect_local_files(base: &PathBuf) -> HashSet<String> {
+    let mut files = HashSet::new();
+    if let Ok(entries) = walkdir(base, base) {
+        files = entries;
+    }
+    files
+}
+
+fn walkdir(base: &PathBuf, current: &PathBuf) -> Result<HashSet<String>, std::io::Error> {
+    let mut result = HashSet::new();
+    if !current.is_dir() {
+        return Ok(result);
+    }
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            result.extend(walkdir(base, &path)?);
+        } else if let Ok(relative) = path.strip_prefix(base) {
+            // Normalize to forward slashes for cross-platform comparison
+            let rel_str = relative.to_string_lossy().replace('\\', "/");
+            result.insert(rel_str);
+        }
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn check_updates(app: AppHandle) -> Result<String, String> {
     let store = get_store(&app);
-    let base_url = store
-        .get("build_server_url")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().build_server_url);
+    let defaults = AppSettings::default();
+    let base_url = store_get_string(&store, "build_server_url", defaults.build_server_url);
+    let install_path = store_get_string(&store, "install_path", defaults.install_path);
 
-    let install_path = store
-        .get("install_path")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().install_path);
-
-    let entries = fetch_manifest(&app, &base_url).await?;
+    let client = http_client();
+    let entries = fetch_manifest(&app, &client, &base_url).await?;
     let install_dir = PathBuf::from(&install_path);
 
-    // Compare local files against manifest to count what needs updating
     let mut needs_download = 0;
     let mut up_to_date = 0;
 
@@ -248,7 +279,7 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
         if file_path.exists() {
             if let Some(expected_hash) = &entry.hash {
                 match hash_file(&file_path) {
-                    Ok(local_hash) if local_hash == *expected_hash => {
+                    Ok(local_hash) if hashes_match(&local_hash, expected_hash) => {
                         up_to_date += 1;
                     }
                     _ => {
@@ -256,7 +287,6 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
                     }
                 }
             } else {
-                // No hash in manifest — can't verify, assume up to date
                 up_to_date += 1;
             }
         } else {
@@ -264,41 +294,47 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
         }
     }
 
-    if needs_download == 0 {
-        Ok(format!(
-            "All {} files are up to date!",
-            entries.len()
-        ))
+    // Check for orphaned files
+    let manifest_paths: HashSet<String> = entries
+        .iter()
+        .map(|e| e.path.replace('\\', "/"))
+        .collect();
+    let local_files = collect_local_files(&install_dir);
+    let orphans = local_files.difference(&manifest_paths).count();
+
+    let mut msg = if needs_download == 0 {
+        format!("All {} files are up to date!", entries.len())
     } else {
-        Ok(format!(
+        format!(
             "{} files need updating ({} already up to date)",
             needs_download, up_to_date
-        ))
+        )
+    };
+
+    if orphans > 0 {
+        msg.push_str(&format!(". {} old files will be removed", orphans));
     }
+
+    Ok(msg)
 }
 
 #[tauri::command]
 pub async fn download_game(app: AppHandle) -> Result<(), String> {
     let store = get_store(&app);
-    let base_url = store
-        .get("build_server_url")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().build_server_url);
-
-    let install_path = store
-        .get("install_path")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().install_path);
+    let defaults = AppSettings::default();
+    let base_url = store_get_string(&store, "build_server_url", defaults.build_server_url);
+    let install_path = store_get_string(&store, "install_path", defaults.install_path);
 
     app.emit("log", "Fetching file manifest...".to_string())
         .map_err(|e| e.to_string())?;
 
-    let entries = fetch_manifest(&app, &base_url).await?;
+    let client = http_client();
+    let entries = fetch_manifest(&app, &client, &base_url).await?;
     let install_dir = PathBuf::from(&install_path);
     std::fs::create_dir_all(&install_dir)
         .map_err(|e| format!("Failed to create install directory: {}", e))?;
 
-    // Determine which files actually need downloading (incremental update)
+    // ── Phase 1: Determine which files need downloading ──
     let mut to_download: Vec<&ManifestEntry> = Vec::new();
     let mut skipped = 0;
 
@@ -307,19 +343,39 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
         if file_path.exists() {
             if let Some(expected_hash) = &entry.hash {
                 match hash_file(&file_path) {
-                    Ok(local_hash) if local_hash == *expected_hash => {
+                    Ok(local_hash) if hashes_match(&local_hash, expected_hash) => {
                         skipped += 1;
                         continue;
                     }
                     _ => {}
                 }
             } else {
-                // No hash available — skip existing file (can't determine if changed)
                 skipped += 1;
                 continue;
             }
         }
         to_download.push(entry);
+    }
+
+    // ── Phase 2: Remove orphaned files not in manifest ──
+    let manifest_paths: HashSet<String> = entries
+        .iter()
+        .map(|e| e.path.replace('\\', "/"))
+        .collect();
+    let local_files = collect_local_files(&install_dir);
+    let mut orphans_removed = 0;
+    for orphan in local_files.difference(&manifest_paths) {
+        let orphan_path = install_dir.join(orphan);
+        if std::fs::remove_file(&orphan_path).is_ok() {
+            orphans_removed += 1;
+        }
+    }
+    if orphans_removed > 0 {
+        app.emit(
+            "log",
+            format!("Removed {} old files", orphans_removed),
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     if to_download.is_empty() {
@@ -338,17 +394,21 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let client = reqwest::Client::new();
+    // ── Phase 3: Download files, continue on individual failures ──
     let total = to_download.len();
+    let mut failed: Vec<String> = Vec::new();
 
     for (i, entry) in to_download.iter().enumerate() {
         let file_url = format!("{}/{}", base_url, entry.path);
         let file_path = install_dir.join(&entry.path);
 
-        // Create parent directories
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {}", e))?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let msg = format!("FAILED {}: can't create directory: {}", entry.path, e);
+                app.emit("log", msg.clone()).ok();
+                failed.push(msg);
+                continue;
+            }
         }
 
         app.emit(
@@ -359,47 +419,90 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
                 file: entry.path.clone(),
             },
         )
-        .map_err(|e| e.to_string())?;
+        .ok();
 
-        app.emit("log", format!("Downloading: {}", entry.path))
-            .map_err(|e| e.to_string())?;
+        app.emit("log", format!("Downloading: {}", entry.path)).ok();
 
-        let response = client
-            .get(&file_url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to download {}: {}", entry.path, e))?;
+        // Download the file
+        let response = match client.get(&file_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("FAILED {}: {}", entry.path, e);
+                app.emit("log", msg.clone()).ok();
+                failed.push(msg);
+                continue;
+            }
+        };
 
         if !response.status().is_success() {
-            return Err(format!(
-                "Server returned {} for {}",
-                response.status(),
-                entry.path
-            ));
+            let msg = format!(
+                "FAILED {}: server returned {}",
+                entry.path,
+                response.status()
+            );
+            app.emit("log", msg.clone()).ok();
+            failed.push(msg);
+            continue;
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read {}: {}", entry.path, e))?;
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("FAILED {}: read error: {}", entry.path, e);
+                app.emit("log", msg.clone()).ok();
+                failed.push(msg);
+                continue;
+            }
+        };
 
-        // Verify hash of downloaded data before writing to disk
+        // Verify hash before writing
         if let Some(expected_hash) = &entry.hash {
             let actual_hash = hash_bytes(&bytes);
-            if actual_hash != *expected_hash {
-                return Err(format!(
-                    "Hash mismatch for {}: expected {}, got {}. Download may be corrupted or tampered with.",
+            if !hashes_match(&actual_hash, expected_hash) {
+                let msg = format!(
+                    "FAILED {}: hash mismatch (expected {}, got {})",
                     entry.path, expected_hash, actual_hash
-                ));
+                );
+                app.emit("log", msg.clone()).ok();
+                failed.push(msg);
+                continue;
             }
         }
 
-        std::fs::write(&file_path, &bytes)
-            .map_err(|e| format!("Failed to write {}: {}", entry.path, e))?;
+        // Write to temp file then rename (atomic-ish) to avoid partial writes
+        let temp_path = file_path.with_extension("sw_tmp");
+        if let Err(e) = std::fs::write(&temp_path, &bytes) {
+            let msg = format!("FAILED {}: write error: {}", entry.path, e);
+            app.emit("log", msg.clone()).ok();
+            failed.push(msg);
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_path);
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&temp_path, &file_path) {
+            let msg = format!("FAILED {}: rename error: {}", entry.path, e);
+            app.emit("log", msg.clone()).ok();
+            failed.push(msg);
+            let _ = std::fs::remove_file(&temp_path);
+            continue;
+        }
     }
 
-    app.emit("log", "Download complete!".to_string())
-        .map_err(|e| e.to_string())?;
+    // ── Report results ──
+    if failed.is_empty() {
+        app.emit("log", "Download complete!".to_string()).ok();
+    } else {
+        app.emit(
+            "log",
+            format!(
+                "Download finished with {} failures out of {}",
+                failed.len(),
+                total
+            ),
+        )
+        .ok();
+    }
+
     app.emit(
         "download-progress",
         DownloadProgress {
@@ -408,25 +511,38 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
             file: "Complete".to_string(),
         },
     )
-    .map_err(|e| e.to_string())?;
+    .ok();
 
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} files failed to download", failed.len()))
+    }
 }
 
 #[tauri::command]
 pub async fn launch_game(app: AppHandle) -> Result<(), String> {
     let store = get_store(&app);
-    let install_path = store
-        .get("install_path")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().install_path);
-
+    let install_path = store_get_string(&store, "install_path", AppSettings::default().install_path);
     let install_dir = PathBuf::from(&install_path);
+
+    // Check for stored auth token to pass to the game
+    let auth_token = store
+        .get("access_token")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|t| !t.is_empty());
 
     let exe_path = if cfg!(target_os = "macos") {
         let app_path = install_dir.join("Siege Worlds.app");
         if app_path.exists() {
             app_path
+        } else {
+            install_dir.join("Siege Worlds")
+        }
+    } else if cfg!(target_os = "linux") {
+        let path = install_dir.join("Siege Worlds.x86_64");
+        if path.exists() {
+            path
         } else {
             install_dir.join("Siege Worlds")
         }
@@ -441,16 +557,39 @@ pub async fn launch_game(app: AppHandle) -> Result<(), String> {
         ));
     }
 
-    app.emit("log", format!("Launching: {}", exe_path.display()))
-        .map_err(|e| e.to_string())?;
+    if auth_token.is_some() {
+        app.emit("log", "Launching with SSO token (auto-login)...".to_string())
+            .map_err(|e| e.to_string())?;
+    } else {
+        app.emit("log", format!("Launching: {}", exe_path.display()))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Build launch arguments: pass JWT as --auth-token if user is signed in
+    let mut args: Vec<String> = Vec::new();
+    if let Some(token) = &auth_token {
+        args.push("--auth-token".to_string());
+        args.push(token.clone());
+    }
 
     if cfg!(target_os = "macos") {
-        Command::new("open")
-            .arg(&exe_path)
+        let mut cmd = Command::new("open");
+        cmd.arg(&exe_path);
+        if !args.is_empty() {
+            cmd.arg("--args");
+            cmd.args(&args);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("Failed to launch game: {}", e))?;
+    } else if cfg!(target_os = "linux") {
+        let _ = Command::new("chmod").arg("+x").arg(&exe_path).output();
+        Command::new(&exe_path)
+            .args(&args)
             .spawn()
             .map_err(|e| format!("Failed to launch game: {}", e))?;
     } else {
         Command::new(&exe_path)
+            .args(&args)
             .spawn()
             .map_err(|e| format!("Failed to launch game: {}", e))?;
     }
@@ -490,18 +629,13 @@ pub struct AuthState {
     pub user: Option<SSOUser>,
 }
 
-/// SSO login timeout: 2 minutes for the user to complete browser login.
 const SSO_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tauri::command]
 pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
     let store = get_store(&app);
-    let sso_url = store
-        .get("sso_url")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().sso_url);
+    let sso_url = store_get_string(&store, "sso_url", AppSettings::default().sso_url);
 
-    // Start a localhost callback server
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Failed to bind: {}", e))?;
     let port = listener
@@ -514,26 +648,13 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
         sso_url, port
     );
 
-    // Open browser
     app.emit("log", "Opening browser for sign in...".to_string())
         .map_err(|e| e.to_string())?;
 
     open::that(&login_url).map_err(|e| format!("Failed to open browser: {}", e))?;
 
-    // Wait for the callback in a blocking thread, WITH a timeout
     let token_result: Result<(String, String), String> =
         tokio::task::spawn_blocking(move || {
-            // Set timeout so the listener doesn't block forever
-            listener
-                .set_nonblocking(false)
-                .map_err(|e| format!("Failed to set blocking: {}", e))?;
-            listener
-                .set_ttl(120)
-                .ok(); // best-effort
-
-            // Use SO_RCVTIMEO equivalent via accept timeout
-            // We'll set a read timeout on each accepted stream instead,
-            // and use the listener's non-blocking + polling approach
             listener
                 .set_nonblocking(true)
                 .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
@@ -563,7 +684,6 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
             let mut refresh_token = String::new();
             let deadline = std::time::Instant::now() + SSO_TIMEOUT;
 
-            // Handle up to 2 requests: first the callback page, then the token relay
             let mut requests_handled = 0;
             while requests_handled < 2 {
                 if std::time::Instant::now() > deadline {
@@ -579,7 +699,6 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                     Err(e) => return Err(format!("Failed to accept: {}", e)),
                 };
 
-                // Set read timeout on the accepted connection
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
                 let mut stream = stream;
@@ -592,7 +711,6 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                 requests_handled += 1;
 
                 if request.contains("/receive-token") {
-                    // Extract token from query params
                     if let Some(query_start) = request.find("/receive-token?") {
                         let query = &request[query_start + 15..];
                         let query = query.split_whitespace().next().unwrap_or("");
@@ -613,12 +731,10 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                             }
                         }
                     }
-                    // No wildcard CORS — only the page we served should call this
                     let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK";
                     let _ = stream.write_all(response.as_bytes());
                     break;
                 } else {
-                    // Serve the callback HTML page
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
                         callback_html.len(),
@@ -639,10 +755,9 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
 
     let (access_token, refresh_token) = token_result?;
 
-    // Verify the token with the SSO server
-    let user = verify_token_internal(&sso_url, &access_token).await?;
+    let client = http_client();
+    let user = verify_token_internal(&client, &sso_url, &access_token).await?;
 
-    // Store tokens
     let store = get_store(&app);
     store.set("access_token", serde_json::json!(&access_token));
     store.set("refresh_token", serde_json::json!(&refresh_token));
@@ -660,8 +775,11 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
     })
 }
 
-async fn verify_token_internal(sso_url: &str, token: &str) -> Result<SSOUser, String> {
-    let client = reqwest::Client::new();
+async fn verify_token_internal(
+    client: &reqwest::Client,
+    sso_url: &str,
+    token: &str,
+) -> Result<SSOUser, String> {
     let res = client
         .post(format!("{}/api/verify", sso_url))
         .json(&serde_json::json!({ "token": token }))
@@ -690,23 +808,20 @@ async fn verify_token_internal(sso_url: &str, token: &str) -> Result<SSOUser, St
 #[tauri::command]
 pub async fn verify_token(app: AppHandle) -> Result<AuthState, String> {
     let store = get_store(&app);
-    let sso_url = store
-        .get("sso_url")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| AppSettings::default().sso_url);
+    let sso_url = store_get_string(&store, "sso_url", AppSettings::default().sso_url);
 
     let token = store
         .get("access_token")
         .and_then(|v| v.as_str().map(|s| s.to_string()));
 
+    let client = http_client();
     match token {
-        Some(t) if !t.is_empty() => match verify_token_internal(&sso_url, &t).await {
+        Some(t) if !t.is_empty() => match verify_token_internal(&client, &sso_url, &t).await {
             Ok(user) => Ok(AuthState {
                 logged_in: true,
                 user: Some(user),
             }),
             Err(_) => {
-                // Token expired, clear it
                 store.delete("access_token");
                 store.delete("refresh_token");
                 let _ = store.save();
@@ -740,4 +855,329 @@ pub fn logout(app: AppHandle) -> Result<(), String> {
     store.delete("access_token");
     store.delete("refresh_token");
     store.save().map_err(|e| format!("Failed to save: {}", e))
+}
+
+// ─── Dynamic Slideshow from Supabase ────────────────────────────────────────
+
+const SUPABASE_URL: &str = "https://qprwdignwccmcnninnlv.supabase.co";
+const SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwcndkaWdud2NjbWNubmlubmx2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ0NDc4NjMsImV4cCI6MjA5MDAyMzg2M30.wQtnwkxYLON61hRGuSbdfrzqXWrodpr9GDr59SwiNZ4";
+const SUPABASE_BUCKET: &str = "launcher-assets";
+
+// ─── Launcher Config (shared via Supabase) ──────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LauncherConfig {
+    pub greeting: String,
+}
+
+/// Fetch the shared launcher config from Supabase.
+#[tauri::command]
+pub async fn fetch_launcher_config(_app: AppHandle) -> LauncherConfig {
+    let client = http_client();
+    let url = format!(
+        "{}/storage/v1/object/public/{}/launcher-config.json",
+        SUPABASE_URL, SUPABASE_BUCKET
+    );
+
+    match client.get(&url).send().await {
+        Ok(res) if res.status().is_success() => {
+            res.json::<LauncherConfig>().await.unwrap_or(LauncherConfig {
+                greeting: "Launcher ready.".to_string(),
+            })
+        }
+        _ => LauncherConfig {
+            greeting: "Launcher ready.".to_string(),
+        },
+    }
+}
+
+/// Save the shared launcher config to Supabase (admin only).
+#[tauri::command]
+pub async fn save_launcher_config(app: AppHandle, config: LauncherConfig) -> Result<(), String> {
+    let client = http_client();
+    let url = format!(
+        "{}/storage/v1/object/{}/launcher-config.json",
+        SUPABASE_URL, SUPABASE_BUCKET
+    );
+
+    let body = serde_json::to_vec(&config).map_err(|e| format!("JSON error: {}", e))?;
+
+    let res = client
+        .post(&url)
+        .header("apikey", SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Content-Type", "application/json")
+        .header("x-upsert", "true")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Save config failed ({}): {}", status, body));
+    }
+
+    app.emit("log", "Greeting updated for all users.".to_string()).ok();
+    Ok(())
+}
+
+/// Returns a list of slide image URLs, fetched from Supabase Storage.
+/// Falls back to an empty list if the fetch fails (frontend uses bundled images).
+#[tauri::command]
+pub async fn fetch_slides(app: AppHandle) -> Vec<String> {
+    match fetch_slides_internal(&app).await {
+        Ok(urls) => urls,
+        Err(e) => {
+            app.emit("log", format!("Using bundled slides ({})", e)).ok();
+            Vec::new()
+        }
+    }
+}
+
+async fn fetch_slides_internal(app: &AppHandle) -> Result<Vec<String>, String> {
+    let client = http_client();
+
+    // List files in the launcher-assets bucket
+    let list_url = format!(
+        "{}/storage/v1/object/list/{}",
+        SUPABASE_URL, SUPABASE_BUCKET
+    );
+
+    let res = client
+        .post(&list_url)
+        .header("apikey", SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .json(&serde_json::json!({
+            "prefix": "",
+            "limit": 100,
+            "sortBy": { "column": "name", "order": "asc" }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Supabase returned {}", res.status()));
+    }
+
+    let files: Vec<serde_json::Value> = res
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    // Filter for image files and build public URLs
+    let image_extensions = ["jpg", "jpeg", "png", "webp"];
+    let mut urls: Vec<String> = Vec::new();
+
+    for file in &files {
+        if let Some(name) = file.get("name").and_then(|n| n.as_str()) {
+            let lower = name.to_lowercase();
+            if image_extensions.iter().any(|ext| lower.ends_with(ext)) {
+                let url = format!(
+                    "{}/storage/v1/object/public/{}/{}",
+                    SUPABASE_URL, SUPABASE_BUCKET, name
+                );
+                urls.push(url);
+            }
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("No slide images found in bucket".to_string());
+    }
+
+    // Check for ordering file
+    let order_url = format!(
+        "{}/storage/v1/object/public/{}/slide-order.json",
+        SUPABASE_URL, SUPABASE_BUCKET
+    );
+    if let Ok(order_res) = client.get(&order_url).send().await {
+        if order_res.status().is_success() {
+            if let Ok(order) = order_res.json::<Vec<String>>().await {
+                // Reorder urls based on the order list
+                let mut ordered: Vec<String> = Vec::new();
+                for name in &order {
+                    if let Some(url) = urls.iter().find(|u| u.ends_with(name)) {
+                        ordered.push(url.clone());
+                    }
+                }
+                // Add any urls not in the order file at the end
+                for url in &urls {
+                    if !ordered.contains(url) {
+                        ordered.push(url.clone());
+                    }
+                }
+                urls = ordered;
+            }
+        }
+    }
+
+    // Cache the images locally for offline use
+    let cache_dir = cache_slides_dir();
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        app.emit("log", format!("Warning: can't create cache dir: {}", e)).ok();
+        return Ok(urls);
+    }
+
+    for url in &urls {
+        let filename = url.rsplit('/').next().unwrap_or("slide.jpg");
+        let cache_path = cache_dir.join(filename);
+        // Only download if not already cached
+        if !cache_path.exists() {
+            if let Ok(resp) = client.get(url).send().await {
+                if let Ok(bytes) = resp.bytes().await {
+                    let _ = std::fs::write(&cache_path, &bytes);
+                }
+            }
+        }
+    }
+
+    Ok(urls)
+}
+
+/// Returns cached slide file paths for offline fallback.
+#[tauri::command]
+pub fn get_cached_slides() -> Vec<String> {
+    let cache_dir = cache_slides_dir();
+    if !cache_dir.exists() {
+        return Vec::new();
+    }
+
+    let image_extensions = ["jpg", "jpeg", "png", "webp"];
+    let mut paths: Vec<String> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if image_extensions.contains(&ext.to_lowercase().as_str()) {
+                    paths.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    paths.sort();
+    paths
+}
+
+fn cache_slides_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("siege-worlds-launcher")
+        .join("slides")
+}
+
+/// Save slide ordering to Supabase as a JSON file.
+#[tauri::command]
+pub async fn save_slide_order(app: AppHandle, order: Vec<String>) -> Result<(), String> {
+    let client = http_client();
+    let url = format!(
+        "{}/storage/v1/object/{}/slide-order.json",
+        SUPABASE_URL, SUPABASE_BUCKET
+    );
+
+    let body = serde_json::to_vec(&order).map_err(|e| format!("JSON error: {}", e))?;
+
+    let res = client
+        .post(&url)
+        .header("apikey", SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Content-Type", "application/json")
+        .header("x-upsert", "true")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to save order: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Save order failed ({}): {}", status, body));
+    }
+
+    app.emit("log", "Slide order saved".to_string()).ok();
+    Ok(())
+}
+
+/// Upload a slide image to Supabase Storage. Requires the user's SSO token
+/// (which is a Supabase JWT) for authenticated upload.
+#[tauri::command]
+pub async fn upload_slide(
+    app: AppHandle,
+    filename: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    let client = http_client();
+    let upload_url = format!(
+        "{}/storage/v1/object/{}/{}",
+        SUPABASE_URL, SUPABASE_BUCKET, filename
+    );
+
+    let content_type = if filename.ends_with(".png") {
+        "image/png"
+    } else if filename.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+
+    let res = client
+        .post(&upload_url)
+        .header("apikey", SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Content-Type", content_type)
+        .header("x-upsert", "true")
+        .body(data)
+        .send()
+        .await
+        .map_err(|e| format!("Upload failed: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Upload failed ({}): {}", status, body));
+    }
+
+    let public_url = format!(
+        "{}/storage/v1/object/public/{}/{}",
+        SUPABASE_URL, SUPABASE_BUCKET, filename
+    );
+
+    app.emit("log", format!("Uploaded: {}", filename)).ok();
+    Ok(public_url)
+}
+
+/// Delete a slide image from Supabase Storage.
+#[tauri::command]
+pub async fn delete_slide(app: AppHandle, filename: String) -> Result<(), String> {
+
+    let client = http_client();
+    let delete_url = format!(
+        "{}/storage/v1/object/{}/{}",
+        SUPABASE_URL, SUPABASE_BUCKET, filename
+    );
+
+    let res = client
+        .delete(&delete_url)
+        .header("apikey", SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .send()
+        .await
+        .map_err(|e| format!("Delete failed: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Delete failed ({}): {}", status, body));
+    }
+
+    // Remove from local cache too
+    let cache_path = cache_slides_dir().join(&filename);
+    let _ = std::fs::remove_file(&cache_path);
+
+    app.emit("log", format!("Deleted: {}", filename)).ok();
+    Ok(())
 }
