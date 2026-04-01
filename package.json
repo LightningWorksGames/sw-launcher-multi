@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "serve": "^14.2.0"
+    "serve": "^14.2.0",
+    "supabase": "^2.84.5"
   }
 }
