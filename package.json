@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "devDependencies": {
+    "@tauri-apps/cli": "^2",
     "serve": "^14.2.0"
   }
 }

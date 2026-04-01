@@ -318,14 +318,21 @@ btnSettingsSave.addEventListener('click', async () => {
   };
   try {
     await invoke('save_settings', { settings });
-    // Save greeting to Supabase (shared with all users)
-    const greeting = document.getElementById('set-greeting').value;
-    await invoke('save_launcher_config', { config: { greeting } });
     log('Settings saved.');
-    settingsPanel.style.display = 'none';
   } catch (e) {
     log('Failed to save settings: ' + e);
   }
+  // Save greeting to Supabase separately (admin-only, may fail independently)
+  if (isAdmin()) {
+    try {
+      const greeting = document.getElementById('set-greeting').value;
+      await invoke('save_launcher_config', { config: { greeting } });
+      log('Greeting updated for all users.');
+    } catch (e) {
+      log('Failed to save greeting: ' + e);
+    }
+  }
+  settingsPanel.style.display = 'none';
 });
 
 btnSettingsCancel.addEventListener('click', () => {
