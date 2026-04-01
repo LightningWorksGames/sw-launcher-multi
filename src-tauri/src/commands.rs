@@ -200,22 +200,6 @@ fn get_user_token(app: &AppHandle) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Verify the current user is an admin. Returns the user on success.
-async fn require_admin(app: &AppHandle) -> Result<SSOUser, String> {
-    let token = get_user_token(app).ok_or("Not signed in")?;
-    let client = http_client(app);
-    let sso_url = store_get_string(
-        &get_store(app),
-        "sso_url",
-        AppSettings::default().sso_url,
-    );
-    let user = verify_token_internal(&client, &sso_url, &token).await?;
-    if user.role == "admin" || user.role == "superadmin" {
-        Ok(user)
-    } else {
-        Err("Admin access required".to_string())
-    }
-}
 
 async fn fetch_manifest(
     app: &AppHandle,
@@ -927,6 +911,45 @@ const SUPABASE_URL: &str = "https://qprwdignwccmcnninnlv.supabase.co";
 const SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwcndkaWdud2NjbWNubmlubmx2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ0NDc4NjMsImV4cCI6MjA5MDAyMzg2M30.wQtnwkxYLON61hRGuSbdfrzqXWrodpr9GDr59SwiNZ4";
 const SUPABASE_BUCKET: &str = "launcher-assets";
 
+/// Edge Function URL for admin storage operations.
+/// The function verifies the SSO token, checks admin role, and performs
+/// writes using the service role key (never exposed to the client).
+const ADMIN_STORAGE_URL: &str = "https://qprwdignwccmcnninnlv.supabase.co/functions/v1/admin-storage";
+
+/// Call the admin-storage Edge Function with the user's SSO token.
+async fn admin_storage_call(
+    app: &AppHandle,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let token = get_user_token(app).ok_or("Not signed in")?;
+    let client = http_client(app);
+
+    let res = client
+        .post(ADMIN_STORAGE_URL)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    let status = res.status();
+    let response_body: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    if !status.is_success() {
+        let error = response_body
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("Unknown error");
+        return Err(format!("{}", error));
+    }
+
+    Ok(response_body)
+}
+
 // ─── Launcher Config (shared via Supabase) ──────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -955,35 +978,13 @@ pub async fn fetch_launcher_config(app: AppHandle) -> LauncherConfig {
     }
 }
 
-/// Save the shared launcher config to Supabase (admin only).
+/// Save the shared launcher config to Supabase via Edge Function (admin only).
 #[tauri::command]
 pub async fn save_launcher_config(app: AppHandle, config: LauncherConfig) -> Result<(), String> {
-    require_admin(&app).await?;
-    let token = get_user_token(&app).ok_or("Not signed in")?;
-    let client = http_client(&app);
-    let url = format!(
-        "{}/storage/v1/object/{}/launcher-config.json",
-        SUPABASE_URL, SUPABASE_BUCKET
-    );
-
-    let body = serde_json::to_vec(&config).map_err(|e| format!("JSON error: {}", e))?;
-
-    let res = client
-        .post(&url)
-        .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("x-upsert", "true")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to save config: {}", e))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("Save config failed ({}): {}", status, body));
-    }
+    admin_storage_call(&app, serde_json::json!({
+        "action": "save-config",
+        "config": config,
+    })).await?;
 
     app.emit("log", "Greeting updated for all users.".to_string()).ok();
     Ok(())
@@ -1153,113 +1154,54 @@ fn cache_slides_dir() -> PathBuf {
         .join("slides")
 }
 
-/// Save slide ordering to Supabase as a JSON file (admin only).
+/// Save slide ordering to Supabase via Edge Function (admin only).
 #[tauri::command]
 pub async fn save_slide_order(app: AppHandle, order: Vec<String>) -> Result<(), String> {
-    require_admin(&app).await?;
-    let token = get_user_token(&app).ok_or("Not signed in")?;
-    let client = http_client(&app);
-    let url = format!(
-        "{}/storage/v1/object/{}/slide-order.json",
-        SUPABASE_URL, SUPABASE_BUCKET
-    );
-
-    let body = serde_json::to_vec(&order).map_err(|e| format!("JSON error: {}", e))?;
-
-    let res = client
-        .post(&url)
-        .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("x-upsert", "true")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to save order: {}", e))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("Save order failed ({}): {}", status, body));
-    }
+    admin_storage_call(&app, serde_json::json!({
+        "action": "save-order",
+        "order": order,
+    })).await?;
 
     app.emit("log", "Slide order saved".to_string()).ok();
     Ok(())
 }
 
-/// Upload a slide image to Supabase Storage (admin only).
+/// Upload a slide image via Edge Function (admin only).
 #[tauri::command]
 pub async fn upload_slide(
     app: AppHandle,
     filename: String,
     data: Vec<u8>,
 ) -> Result<String, String> {
-    require_admin(&app).await?;
-    let token = get_user_token(&app).ok_or("Not signed in")?;
-    let client = http_client(&app);
-    let upload_url = format!(
-        "{}/storage/v1/object/{}/{}",
-        SUPABASE_URL, SUPABASE_BUCKET, filename
-    );
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
 
-    let content_type = if filename.ends_with(".png") {
-        "image/png"
-    } else if filename.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "image/jpeg"
-    };
+    let result = admin_storage_call(&app, serde_json::json!({
+        "action": "upload",
+        "filename": filename,
+        "data": b64,
+    })).await?;
 
-    let res = client
-        .post(&upload_url)
-        .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", content_type)
-        .header("x-upsert", "true")
-        .body(data)
-        .send()
-        .await
-        .map_err(|e| format!("Upload failed: {}", e))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("Upload failed ({}): {}", status, body));
-    }
-
-    let public_url = format!(
-        "{}/storage/v1/object/public/{}/{}",
-        SUPABASE_URL, SUPABASE_BUCKET, filename
-    );
+    let public_url = result
+        .get("url")
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!(
+            "{}/storage/v1/object/public/{}/{}",
+            SUPABASE_URL, SUPABASE_BUCKET, filename
+        ));
 
     app.emit("log", format!("Uploaded: {}", filename)).ok();
     Ok(public_url)
 }
 
-/// Delete a slide image from Supabase Storage (admin only).
+/// Delete a slide image via Edge Function (admin only).
 #[tauri::command]
 pub async fn delete_slide(app: AppHandle, filename: String) -> Result<(), String> {
-    require_admin(&app).await?;
-    let token = get_user_token(&app).ok_or("Not signed in")?;
-    let client = http_client(&app);
-    let delete_url = format!(
-        "{}/storage/v1/object/{}/{}",
-        SUPABASE_URL, SUPABASE_BUCKET, filename
-    );
-
-    let res = client
-        .delete(&delete_url)
-        .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(|e| format!("Delete failed: {}", e))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("Delete failed ({}): {}", status, body));
-    }
+    admin_storage_call(&app, serde_json::json!({
+        "action": "delete",
+        "filename": filename,
+    })).await?;
 
     // Remove from local cache too
     let cache_path = cache_slides_dir().join(&filename);
