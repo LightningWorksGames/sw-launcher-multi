@@ -30,7 +30,7 @@ impl Default for AppSettings {
             install_path: default_install_path(),
             build_server_url: "https://raw.githubusercontent.com/LightningWorksGames/SiegeWorldsBuild/main"
                 .to_string(),
-            sso_url: "http://localhost:3000".to_string(),
+            sso_url: "https://sso.lightningworks.io".to_string(),
             signing_identity: String::new(),
             apple_team_id: String::new(),
             windows_cert_path: String::new(),
