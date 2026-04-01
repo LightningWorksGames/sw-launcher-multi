@@ -1,3 +1,4 @@
+use crate::HttpClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_store::{Store, StoreExt};
 
@@ -102,12 +103,17 @@ pub fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String
 
 #[tauri::command]
 pub async fn select_install_path(app: AppHandle) -> Result<String, String> {
-    let path = app
-        .dialog()
-        .file()
-        .blocking_pick_folder()
-        .map(|p| p.to_string())
-        .ok_or_else(|| "No folder selected".to_string())?;
+    let app_clone = app.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        app_clone
+            .dialog()
+            .file()
+            .blocking_pick_folder()
+            .map(|p| p.to_string())
+            .ok_or_else(|| "No folder selected".to_string())
+    })
+    .await
+    .map_err(|e| format!("Dialog task failed: {}", e))??;
 
     let store = get_store(&app);
     store.set("install_path", serde_json::json!(&path));
@@ -180,13 +186,35 @@ struct DownloadProgress {
     file: String,
 }
 
-/// Shared HTTP client — created once, reused for all requests.
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+/// Get the shared HTTP client from Tauri managed state.
+fn http_client(app: &AppHandle) -> reqwest::Client {
+    app.state::<HttpClient>().0.clone()
+}
+
+/// Get the user's stored access token (their Supabase JWT from SSO).
+fn get_user_token(app: &AppHandle) -> Option<String> {
+    let store = get_store(app);
+    store
+        .get("access_token")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|t| !t.is_empty())
+}
+
+/// Verify the current user is an admin. Returns the user on success.
+async fn require_admin(app: &AppHandle) -> Result<SSOUser, String> {
+    let token = get_user_token(app).ok_or("Not signed in")?;
+    let client = http_client(app);
+    let sso_url = store_get_string(
+        &get_store(app),
+        "sso_url",
+        AppSettings::default().sso_url,
+    );
+    let user = verify_token_internal(&client, &sso_url, &token).await?;
+    if user.role == "admin" || user.role == "superadmin" {
+        Ok(user)
+    } else {
+        Err("Admin access required".to_string())
+    }
 }
 
 async fn fetch_manifest(
@@ -267,7 +295,7 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
     let base_url = store_get_string(&store, "build_server_url", defaults.build_server_url);
     let install_path = store_get_string(&store, "install_path", defaults.install_path);
 
-    let client = http_client();
+    let client = http_client(&app);
     let entries = fetch_manifest(&app, &client, &base_url).await?;
     let install_dir = PathBuf::from(&install_path);
 
@@ -328,7 +356,7 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
     app.emit("log", "Fetching file manifest...".to_string())
         .map_err(|e| e.to_string())?;
 
-    let client = http_client();
+    let client = http_client(&app);
     let entries = fetch_manifest(&app, &client, &base_url).await?;
     let install_dir = PathBuf::from(&install_path);
     std::fs::create_dir_all(&install_dir)
@@ -631,6 +659,22 @@ pub struct AuthState {
 
 const SSO_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Generate a pseudo-random u64 using system time + thread ID + pointer entropy.
+/// Not cryptographic, but sufficient for a local-only anti-injection nonce.
+fn rand_u64() -> u64 {
+    use std::time::SystemTime;
+    let time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let thread_id = format!("{:?}", std::thread::current().id());
+    let mut hasher = Sha256::new();
+    hasher.update(time.to_le_bytes());
+    hasher.update(thread_id.as_bytes());
+    let hash = hasher.finalize();
+    u64::from_le_bytes(hash[..8].try_into().unwrap())
+}
+
 #[tauri::command]
 pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
     let store = get_store(&app);
@@ -642,6 +686,9 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
         .local_addr()
         .map_err(|e| format!("Failed to get port: {}", e))?
         .port();
+
+    // Generate a random nonce to prevent other local processes from injecting tokens
+    let nonce = format!("{:016x}", rand_u64());
 
     let login_url = format!(
         "{}/login?app=siegeworlds&redirect=http://localhost:{}/callback",
@@ -659,7 +706,8 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                 .set_nonblocking(true)
                 .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
 
-            let callback_html = r#"<!DOCTYPE html>
+            // Embed the nonce into the callback page so only our browser tab can submit it
+            let callback_html = format!(r#"<!DOCTYPE html>
 <html>
 <head><title>Signing in...</title></head>
 <body style="background:#1a112e;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
@@ -668,24 +716,23 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
   var hash = window.location.hash.substring(1);
   var params = new URLSearchParams(hash);
   var token = params.get('access_token');
-  if (token) {
-    fetch('/receive-token?token=' + encodeURIComponent(token) + '&refresh=' + encodeURIComponent(params.get('refresh_token') || ''))
-      .then(function() {
+  if (token) {{
+    fetch('/receive-token?state={}&token=' + encodeURIComponent(token) + '&refresh=' + encodeURIComponent(params.get('refresh_token') || ''))
+      .then(function() {{
         document.querySelector('div').innerHTML = '<h2>Signed in!</h2><p>You can close this tab and return to the launcher.</p>';
-      });
-  } else {
+      }});
+  }} else {{
     document.querySelector('div').innerHTML = '<h2>Login failed</h2><p>No token received. Please try again.</p>';
-  }
+  }}
 </script>
 </body>
-</html>"#;
+</html>"#, nonce);
 
             let mut access_token = String::new();
             let mut refresh_token = String::new();
             let deadline = std::time::Instant::now() + SSO_TIMEOUT;
 
-            let mut requests_handled = 0;
-            while requests_handled < 2 {
+            loop {
                 if std::time::Instant::now() > deadline {
                     return Err("Sign in timed out (2 minutes). Please try again.".to_string());
                 }
@@ -708,9 +755,10 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                     continue;
                 }
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                requests_handled += 1;
 
                 if request.contains("/receive-token") {
+                    // Parse query params
+                    let mut received_state = String::new();
                     if let Some(query_start) = request.find("/receive-token?") {
                         let query = &request[query_start + 15..];
                         let query = query.split_whitespace().next().unwrap_or("");
@@ -719,6 +767,10 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                             let key = kv.next().unwrap_or("");
                             let val = kv.next().unwrap_or("");
                             match key {
+                                "state" => {
+                                    received_state =
+                                        urlencoding::decode(val).unwrap_or_default().to_string()
+                                }
                                 "token" => {
                                     access_token =
                                         urlencoding::decode(val).unwrap_or_default().to_string()
@@ -731,16 +783,28 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
                             }
                         }
                     }
+
+                    // Reject if nonce doesn't match (prevents token injection from other processes)
+                    if received_state != nonce {
+                        let response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nInvalid state";
+                        let _ = stream.write_all(response.as_bytes());
+                        access_token.clear();
+                        refresh_token.clear();
+                        continue;
+                    }
+
                     let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK";
                     let _ = stream.write_all(response.as_bytes());
                     break;
                 } else {
+                    // Serve the callback page (initial browser request)
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
                         callback_html.len(),
                         callback_html
                     );
                     let _ = stream.write_all(response.as_bytes());
+                    // Don't break — keep listening for the /receive-token follow-up
                 }
             }
 
@@ -755,7 +819,7 @@ pub async fn start_sso_login(app: AppHandle) -> Result<AuthState, String> {
 
     let (access_token, refresh_token) = token_result?;
 
-    let client = http_client();
+    let client = http_client(&app);
     let user = verify_token_internal(&client, &sso_url, &access_token).await?;
 
     let store = get_store(&app);
@@ -814,7 +878,7 @@ pub async fn verify_token(app: AppHandle) -> Result<AuthState, String> {
         .get("access_token")
         .and_then(|v| v.as_str().map(|s| s.to_string()));
 
-    let client = http_client();
+    let client = http_client(&app);
     match token {
         Some(t) if !t.is_empty() => match verify_token_internal(&client, &sso_url, &t).await {
             Ok(user) => Ok(AuthState {
@@ -872,8 +936,8 @@ pub struct LauncherConfig {
 
 /// Fetch the shared launcher config from Supabase.
 #[tauri::command]
-pub async fn fetch_launcher_config(_app: AppHandle) -> LauncherConfig {
-    let client = http_client();
+pub async fn fetch_launcher_config(app: AppHandle) -> LauncherConfig {
+    let client = http_client(&app);
     let url = format!(
         "{}/storage/v1/object/public/{}/launcher-config.json",
         SUPABASE_URL, SUPABASE_BUCKET
@@ -894,7 +958,9 @@ pub async fn fetch_launcher_config(_app: AppHandle) -> LauncherConfig {
 /// Save the shared launcher config to Supabase (admin only).
 #[tauri::command]
 pub async fn save_launcher_config(app: AppHandle, config: LauncherConfig) -> Result<(), String> {
-    let client = http_client();
+    require_admin(&app).await?;
+    let token = get_user_token(&app).ok_or("Not signed in")?;
+    let client = http_client(&app);
     let url = format!(
         "{}/storage/v1/object/{}/launcher-config.json",
         SUPABASE_URL, SUPABASE_BUCKET
@@ -905,7 +971,7 @@ pub async fn save_launcher_config(app: AppHandle, config: LauncherConfig) -> Res
     let res = client
         .post(&url)
         .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("x-upsert", "true")
         .body(body)
@@ -937,7 +1003,7 @@ pub async fn fetch_slides(app: AppHandle) -> Vec<String> {
 }
 
 async fn fetch_slides_internal(app: &AppHandle) -> Result<Vec<String>, String> {
-    let client = http_client();
+    let client = http_client(&app);
 
     // List files in the launcher-assets bucket
     let list_url = format!(
@@ -1021,6 +1087,12 @@ async fn fetch_slides_internal(app: &AppHandle) -> Result<Vec<String>, String> {
         return Ok(urls);
     }
 
+    // Build set of current remote filenames for pruning
+    let remote_filenames: HashSet<String> = urls
+        .iter()
+        .filter_map(|u| u.rsplit('/').next().map(|s| s.to_string()))
+        .collect();
+
     for url in &urls {
         let filename = url.rsplit('/').next().unwrap_or("slide.jpg");
         let cache_path = cache_dir.join(filename);
@@ -1029,6 +1101,17 @@ async fn fetch_slides_internal(app: &AppHandle) -> Result<Vec<String>, String> {
             if let Ok(resp) = client.get(url).send().await {
                 if let Ok(bytes) = resp.bytes().await {
                     let _ = std::fs::write(&cache_path, &bytes);
+                }
+            }
+        }
+    }
+
+    // Prune cached files that are no longer in the remote slide list
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if !remote_filenames.contains(name) {
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
@@ -1070,10 +1153,12 @@ fn cache_slides_dir() -> PathBuf {
         .join("slides")
 }
 
-/// Save slide ordering to Supabase as a JSON file.
+/// Save slide ordering to Supabase as a JSON file (admin only).
 #[tauri::command]
 pub async fn save_slide_order(app: AppHandle, order: Vec<String>) -> Result<(), String> {
-    let client = http_client();
+    require_admin(&app).await?;
+    let token = get_user_token(&app).ok_or("Not signed in")?;
+    let client = http_client(&app);
     let url = format!(
         "{}/storage/v1/object/{}/slide-order.json",
         SUPABASE_URL, SUPABASE_BUCKET
@@ -1084,7 +1169,7 @@ pub async fn save_slide_order(app: AppHandle, order: Vec<String>) -> Result<(), 
     let res = client
         .post(&url)
         .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("x-upsert", "true")
         .body(body)
@@ -1102,15 +1187,16 @@ pub async fn save_slide_order(app: AppHandle, order: Vec<String>) -> Result<(), 
     Ok(())
 }
 
-/// Upload a slide image to Supabase Storage. Requires the user's SSO token
-/// (which is a Supabase JWT) for authenticated upload.
+/// Upload a slide image to Supabase Storage (admin only).
 #[tauri::command]
 pub async fn upload_slide(
     app: AppHandle,
     filename: String,
     data: Vec<u8>,
 ) -> Result<String, String> {
-    let client = http_client();
+    require_admin(&app).await?;
+    let token = get_user_token(&app).ok_or("Not signed in")?;
+    let client = http_client(&app);
     let upload_url = format!(
         "{}/storage/v1/object/{}/{}",
         SUPABASE_URL, SUPABASE_BUCKET, filename
@@ -1127,7 +1213,7 @@ pub async fn upload_slide(
     let res = client
         .post(&upload_url)
         .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", content_type)
         .header("x-upsert", "true")
         .body(data)
@@ -1150,11 +1236,12 @@ pub async fn upload_slide(
     Ok(public_url)
 }
 
-/// Delete a slide image from Supabase Storage.
+/// Delete a slide image from Supabase Storage (admin only).
 #[tauri::command]
 pub async fn delete_slide(app: AppHandle, filename: String) -> Result<(), String> {
-
-    let client = http_client();
+    require_admin(&app).await?;
+    let token = get_user_token(&app).ok_or("Not signed in")?;
+    let client = http_client(&app);
     let delete_url = format!(
         "{}/storage/v1/object/{}/{}",
         SUPABASE_URL, SUPABASE_BUCKET, filename
@@ -1163,7 +1250,7 @@ pub async fn delete_slide(app: AppHandle, filename: String) -> Result<(), String
     let res = client
         .delete(&delete_url)
         .header("apikey", SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .map_err(|e| format!("Delete failed: {}", e))?;
