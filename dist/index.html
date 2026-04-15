@@ -43,6 +43,10 @@
       </div>
 
       <div id="progress-container" style="display:none">
+        <div id="progress-info">
+          <span id="progress-file"></span>
+          <span id="progress-size"></span>
+        </div>
         <div id="progress-bar">
           <div id="progress-fill"></div>
         </div>
@@ -83,18 +87,6 @@
         <div class="setting-group">
           <label>SSO URL</label>
           <input type="text" id="set-sso-url" />
-        </div>
-        <div class="setting-group">
-          <label>Code Signing Identity (macOS)</label>
-          <input type="text" id="set-signing-identity" placeholder="Developer ID Application: ..." />
-        </div>
-        <div class="setting-group">
-          <label>Apple Team ID</label>
-          <input type="text" id="set-apple-team" placeholder="XXXXXXXXXX" />
-        </div>
-        <div class="setting-group">
-          <label>Windows Certificate Path</label>
-          <input type="text" id="set-win-cert" placeholder="C:\certs\certificate.pfx" />
         </div>
       </div>
       <div id="settings-buttons">

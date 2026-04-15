@@ -37,6 +37,8 @@ const userName = document.getElementById('user-name');
 const progressContainer = document.getElementById('progress-container');
 const progressFill = document.getElementById('progress-fill');
 const progressText = document.getElementById('progress-text');
+const progressFile = document.getElementById('progress-file');
+const progressSize = document.getElementById('progress-size');
 const consoleLog = document.getElementById('console-log');
 const settingsPanel = document.getElementById('settings-panel');
 const tabSlidesBtn = document.getElementById('tab-slides-btn');
@@ -53,6 +55,7 @@ function isAdmin() {
 
 let currentSlide = 0;
 let slideElements = document.querySelectorAll('.slide');
+let slideshowInterval = null;
 
 function nextSlide() {
   if (slideElements.length === 0) return;
@@ -61,7 +64,29 @@ function nextSlide() {
   slideElements[currentSlide].classList.add('active');
 }
 
-setInterval(nextSlide, 5000);
+function startSlideshow() {
+  stopSlideshow();
+  slideshowInterval = setInterval(nextSlide, 5000);
+}
+
+function stopSlideshow() {
+  if (slideshowInterval !== null) {
+    clearInterval(slideshowInterval);
+    slideshowInterval = null;
+  }
+}
+
+// Pause slideshow when the window is hidden/backgrounded to prevent
+// WKWebView compositor layers from accumulating in memory.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopSlideshow();
+  } else {
+    startSlideshow();
+  }
+});
+
+startSlideshow();
 
 async function loadDynamicSlides() {
   if (!tauriReady() || !invoke) return;
@@ -125,6 +150,12 @@ async function init() {
       showUser(auth.user);
       log('Signed in as ' + auth.user.display_name);
     }
+  } catch (e) {}
+
+  // Show platform
+  try {
+    const platform = await invoke('get_platform');
+    log('Platform: ' + platform);
   } catch (e) {}
 
   log(greeting);
@@ -295,9 +326,6 @@ btnSettings.addEventListener('click', () => {
     invoke('get_settings').then(settings => {
       document.getElementById('set-build-url').value = settings.build_server_url;
       document.getElementById('set-sso-url').value = settings.sso_url;
-      document.getElementById('set-signing-identity').value = settings.signing_identity;
-      document.getElementById('set-apple-team').value = settings.apple_team_id;
-      document.getElementById('set-win-cert').value = settings.windows_cert_path;
     }).catch(() => {});
     // Load shared greeting from Supabase
     invoke('fetch_launcher_config').then(config => {
@@ -312,9 +340,6 @@ btnSettingsSave.addEventListener('click', async () => {
     install_path: installPathInput.value,
     build_server_url: document.getElementById('set-build-url').value,
     sso_url: document.getElementById('set-sso-url').value,
-    signing_identity: document.getElementById('set-signing-identity').value,
-    apple_team_id: document.getElementById('set-apple-team').value,
-    windows_cert_path: document.getElementById('set-win-cert').value,
   };
   try {
     await invoke('save_settings', { settings });
@@ -670,26 +695,60 @@ document.getElementById('replace-file-input').addEventListener('change', async (
   e.target.value = '';
 });
 
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+function formatBytes(bytes) {
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + ' GB';
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB';
+  return bytes + ' B';
+}
+
 // ─── Tauri Event Listeners ──────────────────────────────────────────────────
 
-function setupTauriListeners() {
-  listen('log', (event) => {
-    log(event.payload);
-  });
+let tauriUnlisteners = [];
 
-  listen('download-progress', (event) => {
-    const { current, total, file } = event.payload;
-    const pct = Math.round((current / total) * 100);
-    progressFill.style.width = pct + '%';
-    progressText.textContent = pct + '%';
-    progressContainer.style.display = 'flex';
+async function setupTauriListeners() {
+  // Clean up any previous listeners before registering new ones
+  for (const unlisten of tauriUnlisteners) {
+    try { (await unlisten)(); } catch (_) {}
+  }
+  tauriUnlisteners = [];
 
-    if (current >= total) {
-      setTimeout(() => {
-        progressContainer.style.display = 'none';
-      }, 2000);
-    }
-  });
+  tauriUnlisteners.push(
+    listen('log', (event) => {
+      log(event.payload);
+    })
+  );
+
+  tauriUnlisteners.push(
+    listen('download-progress', (event) => {
+      const { current, total, bytes_downloaded, bytes_total, file } = event.payload;
+
+      // Use byte-based progress if size info available, else fall back to file count
+      let pct;
+      if (bytes_total > 0) {
+        pct = Math.round((bytes_downloaded / bytes_total) * 100);
+        progressSize.textContent = formatBytes(bytes_downloaded) + ' / ' + formatBytes(bytes_total);
+      } else {
+        pct = Math.round((current / total) * 100);
+        progressSize.textContent = current + ' / ' + total + ' files';
+      }
+
+      progressFill.style.width = pct + '%';
+      progressText.textContent = pct + '%';
+      progressFile.textContent = file !== 'Complete' ? file : '';
+      progressContainer.style.display = 'flex';
+
+      if (current >= total && file === 'Complete') {
+        setTimeout(() => {
+          progressContainer.style.display = 'none';
+          progressFile.textContent = '';
+          progressSize.textContent = '';
+        }, 2000);
+      }
+    })
+  );
 }
 
 // ─── Start ──────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 use crate::HttpClient;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -11,6 +12,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_store::{Store, StoreExt};
+use urlencoding::encode as url_encode;
 
 // ─── Settings ───────────────────────────────────────────────────────────────
 
@@ -19,9 +21,6 @@ pub struct AppSettings {
     pub install_path: String,
     pub build_server_url: String,
     pub sso_url: String,
-    pub signing_identity: String,
-    pub apple_team_id: String,
-    pub windows_cert_path: String,
 }
 
 impl Default for AppSettings {
@@ -31,9 +30,6 @@ impl Default for AppSettings {
             build_server_url: "https://raw.githubusercontent.com/LightningWorksGames/SiegeWorldsBuild/main"
                 .to_string(),
             sso_url: "https://sso.lightningworks.io".to_string(),
-            signing_identity: String::new(),
-            apple_team_id: String::new(),
-            windows_cert_path: String::new(),
         }
     }
 }
@@ -83,9 +79,6 @@ pub fn get_settings(app: AppHandle) -> AppSettings {
         install_path: store_get_string(&store, "install_path", defaults.install_path),
         build_server_url: store_get_string(&store, "build_server_url", defaults.build_server_url),
         sso_url: store_get_string(&store, "sso_url", defaults.sso_url),
-        signing_identity: store_get_string(&store, "signing_identity", defaults.signing_identity),
-        apple_team_id: store_get_string(&store, "apple_team_id", defaults.apple_team_id),
-        windows_cert_path: store_get_string(&store, "windows_cert_path", defaults.windows_cert_path),
     }
 }
 
@@ -95,9 +88,6 @@ pub fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String
     store.set("install_path", serde_json::json!(settings.install_path));
     store.set("build_server_url", serde_json::json!(settings.build_server_url));
     store.set("sso_url", serde_json::json!(settings.sso_url));
-    store.set("signing_identity", serde_json::json!(settings.signing_identity));
-    store.set("apple_team_id", serde_json::json!(settings.apple_team_id));
-    store.set("windows_cert_path", serde_json::json!(settings.windows_cert_path));
     store.save().map_err(|e| format!("Failed to save: {}", e))
 }
 
@@ -160,15 +150,44 @@ fn hash_file(path: &PathBuf) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn hash_bytes(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
-}
-
 /// Case-insensitive hash comparison (handles uppercase/lowercase hex from different tools).
 fn hashes_match(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+// ─── Platform Detection ────────────────────────────────────────────────────
+
+/// Returns the platform identifier used for manifest selection, e.g.
+/// "macos-arm64", "macos-x86_64", "windows-x86_64", "linux-x86_64".
+fn detect_platform_id() -> String {
+    let os = std::env::consts::OS;      // "macos", "windows", "linux"
+    let arch = std::env::consts::ARCH;  // "aarch64", "x86_64", etc.
+    let arch_label = match arch {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{}-{}", os, arch_label)
+}
+
+/// Human-readable platform name for display.
+fn platform_display_name() -> String {
+    let os_name = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    let arch_name = match std::env::consts::ARCH {
+        "aarch64" => "Apple Silicon",
+        "x86_64" => "x86_64",
+        other => other,
+    };
+    format!("{} ({})", os_name, arch_name)
+}
+
+#[tauri::command]
+pub fn get_platform() -> String {
+    platform_display_name()
 }
 
 // ─── Game Download & Launch ─────────────────────────────────────────────────
@@ -177,13 +196,38 @@ fn hashes_match(a: &str, b: &str) -> bool {
 struct ManifestEntry {
     path: String,
     hash: Option<String>,
+    size: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
 struct DownloadProgress {
     current: usize,
     total: usize,
+    bytes_downloaded: u64,
+    bytes_total: u64,
     file: String,
+}
+
+/// Format a byte count as a human-readable string (e.g. "12.3 MB").
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Percent-encode a file path for use in a URL, encoding each segment
+/// (e.g. spaces → %20) while preserving forward slashes.
+fn encode_path_for_url(path: &str) -> String {
+    path.split('/')
+        .map(|segment| url_encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Get the shared HTTP client from Tauri managed state.
@@ -201,11 +245,18 @@ fn get_user_token(app: &AppHandle) -> Option<String> {
 }
 
 
+/// Result of fetching a manifest: the entries plus the download base URL
+/// (which includes the platform subdirectory when a platform manifest is found).
+struct ManifestResult {
+    entries: Vec<ManifestEntry>,
+    download_base: String,
+}
+
 async fn fetch_manifest(
     app: &AppHandle,
     client: &reqwest::Client,
     base_url: &str,
-) -> Result<Vec<ManifestEntry>, String> {
+) -> Result<ManifestResult, String> {
     if base_url.starts_with("http://") {
         app.emit(
             "log",
@@ -215,19 +266,30 @@ async fn fetch_manifest(
         .map_err(|e| e.to_string())?;
     }
 
-    let manifest_url = format!("{}/file_manifest.json", base_url);
-    let res = client
-        .get(&manifest_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch manifest: {}", e))?;
+    // Try platform-specific manifest first, fall back to generic.
+    // Platform builds live under {base_url}/{platform}/ on the server.
+    let base = base_url.trim_end_matches('/');
+    let platform = detect_platform_id();
+    let platform_url = format!("{}/{}/file_manifest.json", base, platform);
+    let generic_url = format!("{}/file_manifest.json", base);
 
-    if !res.status().is_success() {
-        return Err(format!(
-            "Manifest server returned {}",
-            res.status()
-        ));
-    }
+    let (res, download_base) = match client.get(&platform_url).send().await {
+        Ok(r) if r.status().is_success() => {
+            app.emit("log", format!("Using {} build", platform)).ok();
+            (r, format!("{}/{}", base, platform))
+        }
+        _ => {
+            let r = client
+                .get(&generic_url)
+                .send()
+                .await
+                .map_err(|e| format!("Failed to fetch manifest: {}", e))?;
+            if !r.status().is_success() {
+                return Err(format!("Manifest server returned {}", r.status()));
+            }
+            (r, base.to_string())
+        }
+    };
 
     let text = res
         .text()
@@ -241,7 +303,7 @@ async fn fetch_manifest(
         validate_manifest_path(&entry.path)?;
     }
 
-    Ok(entries)
+    Ok(ManifestResult { entries, download_base })
 }
 
 /// Collect all files under a directory recursively, returning paths relative to the base.
@@ -280,11 +342,13 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
     let install_path = store_get_string(&store, "install_path", defaults.install_path);
 
     let client = http_client(&app);
-    let entries = fetch_manifest(&app, &client, &base_url).await?;
+    let manifest = fetch_manifest(&app, &client, &base_url).await?;
+    let entries = manifest.entries;
     let install_dir = PathBuf::from(&install_path);
 
-    let mut needs_download = 0;
-    let mut up_to_date = 0;
+    let mut needs_download = 0u64;
+    let mut download_bytes = 0u64;
+    let mut up_to_date = 0u64;
 
     for entry in &entries {
         let file_path = install_dir.join(&entry.path);
@@ -296,13 +360,17 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
                     }
                     _ => {
                         needs_download += 1;
+                        download_bytes += entry.size.unwrap_or(0);
                     }
                 }
             } else {
-                up_to_date += 1;
+                // No hash in manifest — can't verify, assume needs update
+                needs_download += 1;
+                download_bytes += entry.size.unwrap_or(0);
             }
         } else {
             needs_download += 1;
+            download_bytes += entry.size.unwrap_or(0);
         }
     }
 
@@ -316,6 +384,11 @@ pub async fn check_updates(app: AppHandle) -> Result<String, String> {
 
     let mut msg = if needs_download == 0 {
         format!("All {} files are up to date!", entries.len())
+    } else if download_bytes > 0 {
+        format!(
+            "{} files need updating ({}, {} already up to date)",
+            needs_download, format_bytes(download_bytes), up_to_date
+        )
     } else {
         format!(
             "{} files need updating ({} already up to date)",
@@ -341,7 +414,9 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let client = http_client(&app);
-    let entries = fetch_manifest(&app, &client, &base_url).await?;
+    let manifest = fetch_manifest(&app, &client, &base_url).await?;
+    let entries = manifest.entries;
+    let download_base = manifest.download_base;
     let install_dir = PathBuf::from(&install_path);
     std::fs::create_dir_all(&install_dir)
         .map_err(|e| format!("Failed to create install directory: {}", e))?;
@@ -362,8 +437,7 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
                     _ => {}
                 }
             } else {
-                skipped += 1;
-                continue;
+                // No hash in manifest — can't verify, must re-download
             }
         }
         to_download.push(entry);
@@ -380,6 +454,17 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
         let orphan_path = install_dir.join(orphan);
         if std::fs::remove_file(&orphan_path).is_ok() {
             orphans_removed += 1;
+            // Remove empty parent directories up to the install root
+            let mut dir = orphan_path.parent().map(|p| p.to_path_buf());
+            while let Some(d) = dir {
+                if d == install_dir {
+                    break;
+                }
+                if std::fs::remove_dir(&d).is_err() {
+                    break; // Not empty or other error — stop climbing
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            }
         }
     }
     if orphans_removed > 0 {
@@ -396,11 +481,18 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    let total_download_bytes: u64 = to_download.iter().filter_map(|e| e.size).sum();
+    let size_info = if total_download_bytes > 0 {
+        format!(", {}", format_bytes(total_download_bytes))
+    } else {
+        String::new()
+    };
     app.emit(
         "log",
         format!(
-            "Downloading {} files ({} already up to date)",
+            "Downloading {} files{} ({} already up to date)",
             to_download.len(),
+            size_info,
             skipped
         ),
     )
@@ -409,9 +501,10 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
     // ── Phase 3: Download files, continue on individual failures ──
     let total = to_download.len();
     let mut failed: Vec<String> = Vec::new();
+    let mut bytes_downloaded: u64 = 0;
 
     for (i, entry) in to_download.iter().enumerate() {
-        let file_url = format!("{}/{}", base_url, entry.path);
+        let file_url = format!("{}/{}", download_base, encode_path_for_url(&entry.path));
         let file_path = install_dir.join(&entry.path);
 
         if let Some(parent) = file_path.parent() {
@@ -428,6 +521,8 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
             DownloadProgress {
                 current: i + 1,
                 total,
+                bytes_downloaded,
+                bytes_total: total_download_bytes,
                 file: entry.path.clone(),
             },
         )
@@ -457,19 +552,73 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
             continue;
         }
 
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
+        // Stream response to temp file while computing hash (avoids buffering entire file in memory)
+        let temp_path = file_path.with_extension("sw_tmp");
+        let mut stream = response.bytes_stream();
+        let mut hasher = Sha256::new();
+        let temp_file = match std::fs::File::create(&temp_path) {
+            Ok(f) => f,
             Err(e) => {
-                let msg = format!("FAILED {}: read error: {}", entry.path, e);
+                let msg = format!("FAILED {}: write error: {}", entry.path, e);
                 app.emit("log", msg.clone()).ok();
                 failed.push(msg);
                 continue;
             }
         };
+        let mut writer = std::io::BufWriter::new(temp_file);
+        let mut stream_err = None;
+        let mut last_progress_bytes: u64 = bytes_downloaded;
 
-        // Verify hash before writing
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    bytes_downloaded += chunk.len() as u64;
+                    hasher.update(&chunk);
+                    if let Err(e) = writer.write_all(&chunk) {
+                        stream_err = Some(format!("FAILED {}: write error: {}", entry.path, e));
+                        break;
+                    }
+                    // Emit byte-level progress every ~256 KB
+                    if bytes_downloaded - last_progress_bytes >= 262_144 {
+                        last_progress_bytes = bytes_downloaded;
+                        app.emit(
+                            "download-progress",
+                            DownloadProgress {
+                                current: i + 1,
+                                total,
+                                bytes_downloaded,
+                                bytes_total: total_download_bytes,
+                                file: entry.path.clone(),
+                            },
+                        )
+                        .ok();
+                    }
+                }
+                Err(e) => {
+                    stream_err = Some(format!("FAILED {}: read error: {}", entry.path, e));
+                    break;
+                }
+            }
+        }
+
+        // Flush buffered writes before checking for errors
+        if stream_err.is_none() {
+            if let Err(e) = writer.flush() {
+                stream_err = Some(format!("FAILED {}: flush error: {}", entry.path, e));
+            }
+        }
+        drop(writer);
+
+        if let Some(msg) = stream_err {
+            app.emit("log", msg.clone()).ok();
+            failed.push(msg);
+            let _ = std::fs::remove_file(&temp_path);
+            continue;
+        }
+
+        // Verify hash before committing
         if let Some(expected_hash) = &entry.hash {
-            let actual_hash = hash_bytes(&bytes);
+            let actual_hash = format!("{:x}", hasher.finalize());
             if !hashes_match(&actual_hash, expected_hash) {
                 let msg = format!(
                     "FAILED {}: hash mismatch (expected {}, got {})",
@@ -477,20 +626,11 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
                 );
                 app.emit("log", msg.clone()).ok();
                 failed.push(msg);
+                let _ = std::fs::remove_file(&temp_path);
                 continue;
             }
         }
 
-        // Write to temp file then rename (atomic-ish) to avoid partial writes
-        let temp_path = file_path.with_extension("sw_tmp");
-        if let Err(e) = std::fs::write(&temp_path, &bytes) {
-            let msg = format!("FAILED {}: write error: {}", entry.path, e);
-            app.emit("log", msg.clone()).ok();
-            failed.push(msg);
-            // Clean up temp file
-            let _ = std::fs::remove_file(&temp_path);
-            continue;
-        }
         if let Err(e) = std::fs::rename(&temp_path, &file_path) {
             let msg = format!("FAILED {}: rename error: {}", entry.path, e);
             app.emit("log", msg.clone()).ok();
@@ -520,6 +660,8 @@ pub async fn download_game(app: AppHandle) -> Result<(), String> {
         DownloadProgress {
             current: total,
             total,
+            bytes_downloaded,
+            bytes_total: total_download_bytes,
             file: "Complete".to_string(),
         },
     )
@@ -1097,11 +1239,23 @@ async fn fetch_slides_internal(app: &AppHandle) -> Result<Vec<String>, String> {
     for url in &urls {
         let filename = url.rsplit('/').next().unwrap_or("slide.jpg");
         let cache_path = cache_dir.join(filename);
-        // Only download if not already cached
+        // Only download if not already cached; stream to disk to avoid buffering
         if !cache_path.exists() {
             if let Ok(resp) = client.get(url).send().await {
-                if let Ok(bytes) = resp.bytes().await {
-                    let _ = std::fs::write(&cache_path, &bytes);
+                if let Ok(file) = std::fs::File::create(&cache_path) {
+                    let mut writer = std::io::BufWriter::new(file);
+                    let mut stream = resp.bytes_stream();
+                    let mut ok = true;
+                    while let Some(Ok(chunk)) = stream.next().await {
+                        if writer.write_all(&chunk).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok || writer.flush().is_err() {
+                        // Remove partial/corrupted cache file
+                        let _ = std::fs::remove_file(&cache_path);
+                    }
                 }
             }
         }

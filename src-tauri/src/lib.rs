@@ -20,6 +20,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(HttpClient(client))
         .invoke_handler(tauri::generate_handler![
+            commands::get_platform,
             commands::get_settings,
             commands::save_settings,
             commands::select_install_path,
