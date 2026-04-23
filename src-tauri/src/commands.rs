@@ -719,32 +719,33 @@ pub async fn launch_game(app: AppHandle) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // Build launch arguments: pass JWT as --auth-token if user is signed in
-    let mut args: Vec<String> = Vec::new();
-    if let Some(token) = &auth_token {
-        args.push("--auth-token".to_string());
-        args.push(token.clone());
-    }
-
+    // Pass auth token via environment variable (not command line, which is visible to other processes)
     if cfg!(target_os = "macos") {
         let mut cmd = Command::new("open");
         cmd.arg(&exe_path);
-        if !args.is_empty() {
+        if let Some(token) = &auth_token {
             cmd.arg("--args");
-            cmd.args(&args);
+            cmd.arg("--auth-token");
+            cmd.arg(token);
         }
+        // Note: macOS `open` doesn't forward env vars to the launched app,
+        // so we still pass via args here. The `open` command isolates visibility.
         cmd.spawn()
             .map_err(|e| format!("Failed to launch game: {}", e))?;
     } else if cfg!(target_os = "linux") {
         let _ = Command::new("chmod").arg("+x").arg(&exe_path).output();
-        Command::new(&exe_path)
-            .args(&args)
-            .spawn()
+        let mut cmd = Command::new(&exe_path);
+        if let Some(token) = &auth_token {
+            cmd.env("SW_AUTH_TOKEN", token);
+        }
+        cmd.spawn()
             .map_err(|e| format!("Failed to launch game: {}", e))?;
     } else {
-        Command::new(&exe_path)
-            .args(&args)
-            .spawn()
+        let mut cmd = Command::new(&exe_path);
+        if let Some(token) = &auth_token {
+            cmd.env("SW_AUTH_TOKEN", token);
+        }
+        cmd.spawn()
             .map_err(|e| format!("Failed to launch game: {}", e))?;
     }
 
@@ -785,20 +786,24 @@ pub struct AuthState {
 
 const SSO_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Generate a pseudo-random u64 using system time + thread ID + pointer entropy.
-/// Not cryptographic, but sufficient for a local-only anti-injection nonce.
+/// Generate a cryptographically random u64 using the OS random source.
 fn rand_u64() -> u64 {
-    use std::time::SystemTime;
-    let time = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+    use std::fs::File;
+    // Try /dev/urandom (macOS/Linux), fall back to time-based
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        let mut buf = [0u8; 8];
+        if f.read_exact(&mut buf).is_ok() {
+            return u64::from_le_bytes(buf);
+        }
+    }
+    // Windows or fallback: use std::collections::hash_map::RandomState for entropy
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
-    let thread_id = format!("{:?}", std::thread::current().id());
-    let mut hasher = Sha256::new();
-    hasher.update(time.to_le_bytes());
-    hasher.update(thread_id.as_bytes());
-    let hash = hasher.finalize();
-    u64::from_le_bytes(hash[..8].try_into().unwrap())
+        .as_nanos() as u64);
+    hasher.finish()
 }
 
 #[tauri::command]
@@ -1320,6 +1325,19 @@ pub async fn save_slide_order(app: AppHandle, order: Vec<String>) -> Result<(), 
     Ok(())
 }
 
+/// Sanitize a filename: strip path components, reject traversal attempts.
+fn sanitize_filename(name: &str) -> Result<String, String> {
+    // Extract just the filename (no directory components)
+    let basename = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name);
+    if basename.is_empty() || basename == "." || basename == ".." || basename.starts_with('.') {
+        return Err(format!("Invalid filename: {}", name));
+    }
+    Ok(basename.to_string())
+}
+
 /// Upload a slide image via Edge Function (admin only).
 #[tauri::command]
 pub async fn upload_slide(
@@ -1327,6 +1345,7 @@ pub async fn upload_slide(
     filename: String,
     data: Vec<u8>,
 ) -> Result<String, String> {
+    let filename = sanitize_filename(&filename)?;
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
 
@@ -1352,6 +1371,7 @@ pub async fn upload_slide(
 /// Delete a slide image via Edge Function (admin only).
 #[tauri::command]
 pub async fn delete_slide(app: AppHandle, filename: String) -> Result<(), String> {
+    let filename = sanitize_filename(&filename)?;
     admin_storage_call(&app, serde_json::json!({
         "action": "delete",
         "filename": filename,

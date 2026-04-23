@@ -99,12 +99,54 @@ jobs:
           # Clean up the certificate file
           rm certificate.p12
 
+      # ─── Windows: Import certificate ───────────────────────────────────
+      - name: Import Windows certificate
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_CERTIFICATE) {
+            $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+            $certPath = "$env:RUNNER_TEMP\certificate.pfx"
+            [IO.File]::WriteAllBytes($certPath, $certBytes)
+            echo "WINDOWS_CERT_PATH=$certPath" >> $env:GITHUB_ENV
+            echo "Certificate written to $certPath"
+          } else {
+            echo "No Windows certificate configured, skipping signing"
+          }
+
       # ─── Build ─────────────────────────────────────────────────────────
       - name: Build Tauri app
         env:
           # Tauri uses these env vars for macOS signing automatically
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: npx tauri build --target ${{ matrix.target }}
+
+      # ─── Windows: Sign executables ─────────────────────────────────────
+      - name: Sign Windows executables
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PATH != ''
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          $certPath = $env:WINDOWS_CERT_PATH
+          $password = $env:WINDOWS_CERTIFICATE_PASSWORD
+          $bundleDir = "src-tauri\target\${{ matrix.target }}\release\bundle"
+
+          # Find and sign all .exe and .msi files
+          $filesToSign = @()
+          $filesToSign += Get-ChildItem -Path $bundleDir -Recurse -Include "*.exe" -ErrorAction SilentlyContinue
+          $filesToSign += Get-ChildItem -Path $bundleDir -Recurse -Include "*.msi" -ErrorAction SilentlyContinue
+
+          foreach ($file in $filesToSign) {
+            echo "Signing: $($file.FullName)"
+            & signtool sign /f $certPath /p $password /tr http://timestamp.digicert.com /td sha256 /fd sha256 $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+              echo "Warning: Failed to sign $($file.Name)"
+            }
+          }
 
       # ─── macOS: Notarize ───────────────────────────────────────────────
       - name: Notarize macOS app
@@ -139,6 +181,15 @@ jobs:
           if [ -f "$KEYCHAIN_PATH" ]; then
             security delete-keychain "$KEYCHAIN_PATH"
           fi
+
+      # ─── Windows: Clean up certificate ─────────────────────────────────
+      - name: Clean up Windows certificate
+        if: runner.os == 'Windows' && always()
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_CERT_PATH -and (Test-Path $env:WINDOWS_CERT_PATH)) {
+            Remove-Item $env:WINDOWS_CERT_PATH -Force
+          }
 
       # ─── Upload artifacts ──────────────────────────────────────────────
       - name: Upload build artifacts

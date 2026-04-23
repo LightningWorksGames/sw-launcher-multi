@@ -658,7 +658,11 @@ function openReplaceModal(url) {
   const modal = document.getElementById('replace-modal');
   const preview = document.getElementById('replace-preview');
   const status = document.getElementById('replace-status');
-  preview.innerHTML = '<img src="' + url + '?t=' + Date.now() + '" alt="" />';
+  preview.innerHTML = '';
+  const previewImg = document.createElement('img');
+  previewImg.src = url + '?t=' + Date.now();
+  previewImg.alt = '';
+  preview.appendChild(previewImg);
   status.textContent = 'Choose a new image to replace this slide.';
   modal.style.display = 'flex';
 }
